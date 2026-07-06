@@ -203,35 +203,59 @@ elif page == "📊 EDA Dashboard":
     with st.expander("🔧 Filters", expanded=False):
         selected_sites = st.multiselect("Filter by Site (optional)", sites_all, default=[])
     df_f = df_eda[df_eda["Site"].isin(selected_sites)] if selected_sites else df_eda
+    df_f = df_f.copy()
 
-    # ---- 1. Company sales during weeks each site was active -----------------
-    st.markdown("### 1. Average Company Sales During Weeks Each Site Was Active")
-    site_weekly_sales = df_f.groupby(["Week", "Site"])["Sales"].max().reset_index()
-    site_weekly_sales_active = site_weekly_sales[site_weekly_sales["Sales"] > 0]
-    site_summary = (
-        site_weekly_sales_active.groupby("Site")
-        .agg(Avg_Sales=("Sales", "mean"), Weeks_Active=("Sales", "count"))
-        .reset_index()
-        .sort_values("Avg_Sales", ascending=True)
+    # ---- Attribute Sales to sites using spend share -------------------------
+    # Sales is one company-wide weekly figure, not tracked per site. To split
+    # credit fairly, each site gets a share of that week's sales proportional
+    # to its share of that week's PAID spend. Social-listening channels
+    # (Brandwatch, Infegy) carry no real ad spend and are excluded from the
+    # allocation entirely, so they correctly receive $0 attributed sales.
+    NON_PAID_CHANNELS = ["Brandwatch", "Infegy"]
+    df_f["Is_Paid"] = ~df_f["Channel"].isin(NON_PAID_CHANNELS)
+    weekly_paid_spend = (
+        df_f[df_f["Is_Paid"]].groupby("Week")["Spend"].sum().rename("Total_Week_Paid_Spend")
     )
-    site_summary["Avg_Sales_M"] = site_summary["Avg_Sales"] / 1e6
+    df_f = df_f.merge(weekly_paid_spend, on="Week", how="left")
+    df_f["Total_Week_Paid_Spend"] = df_f["Total_Week_Paid_Spend"].fillna(0)
+
+    # Fallback for the rare week with $0 total paid spend: split evenly across
+    # that week's paid-channel rows so sales aren't silently dropped.
+    paid_row_counts = df_f[df_f["Is_Paid"]].groupby("Week").size().rename("Paid_Row_Count")
+    df_f = df_f.merge(paid_row_counts, on="Week", how="left")
+
+    df_f["Spend_Share"] = 0.0
+    has_spend_mask = df_f["Is_Paid"] & (df_f["Total_Week_Paid_Spend"] > 0)
+    df_f.loc[has_spend_mask, "Spend_Share"] = (
+        df_f.loc[has_spend_mask, "Spend"] / df_f.loc[has_spend_mask, "Total_Week_Paid_Spend"]
+    )
+    zero_spend_mask = df_f["Is_Paid"] & (df_f["Total_Week_Paid_Spend"] == 0)
+    df_f.loc[zero_spend_mask, "Spend_Share"] = 1.0 / df_f.loc[zero_spend_mask, "Paid_Row_Count"]
+
+    df_f["Allocated_Sales"] = df_f["Sales"] * df_f["Spend_Share"]
+
+    # ---- 1. Total historic sales per site (properly attributed) -------------
+    st.markdown("### 1. Total Historic Sales per Site")
+    total_sales_per_site = (
+        df_f.groupby("Site")["Allocated_Sales"].sum().reset_index()
+        .sort_values("Allocated_Sales", ascending=True)
+    )
+    total_sales_per_site["Sales_M"] = total_sales_per_site["Allocated_Sales"] / 1e6
     fig1 = px.bar(
-        site_summary, x="Avg_Sales_M", y="Site", orientation="h",
-        text=site_summary["Avg_Sales_M"].map(lambda v: f"${v:,.1f}M"),
-        color="Avg_Sales_M", color_continuous_scale="Viridis",
-        hover_data={"Weeks_Active": True, "Avg_Sales_M": ":.1f"},
-        labels={"Avg_Sales_M": "Average Weekly Company Sales ($ Millions)"},
+        total_sales_per_site, x="Sales_M", y="Site", orientation="h",
+        text=total_sales_per_site["Sales_M"].map(lambda v: f"${v:,.1f}M"),
+        color="Sales_M", color_continuous_scale="Viridis",
+        labels={"Sales_M": "Attributed Sales ($ Millions)"},
     )
-    fig1.update_layout(coloraxis_showscale=False, height=450)
+    fig1.update_layout(coloraxis_showscale=False, height=550)
     st.plotly_chart(fig1, use_container_width=True)
     st.info(
-        "📌 **Reading this chart:** Sales is a single **company-wide weekly figure**, not something "
-        "tracked per site — so it can't be summed across sites without double-counting (a site active "
-        "in 100 different weeks would rack up ~100x the true company total). To avoid that distortion, "
-        "this chart shows the **average** weekly company sales during the weeks each site was active "
-        "(hover a bar to see how many weeks that covers). It tells you which sites tended to be running "
-        "during stronger sales periods — it is **not** attributing that revenue to the site itself. "
-        "The KPI on the Overview page is the true, correctly deduplicated total across all weeks."
+        "📌 **How this is calculated:** Sales is a single company-wide weekly figure, not "
+        "tracked per site, so it can't just be summed per site without double-counting. Instead, "
+        "each week's sales is split across sites in proportion to each site's share of that "
+        "week's paid spend. Social-listening channels (Brandwatch, Infegy — e.g. X, Forums, "
+        "Tumblr, Review, non-paid Instagram) carry no ad spend and correctly receive $0 here. "
+        "These are estimated attributions based on spend weight, not verified per-site revenue."
     )
 
     st.markdown("---")
@@ -239,10 +263,10 @@ elif page == "📊 EDA Dashboard":
     # ---- 2. ROAS per site --------------------------------------------------
     st.markdown("### 2. Return on Ad Spend (ROAS) per Site")
     site_spend = df_f.groupby("Site")["Spend"].sum().reset_index()
-    site_sales = site_weekly_sales.groupby("Site")["Sales"].sum().reset_index()
+    site_sales = df_f.groupby("Site")["Allocated_Sales"].sum().reset_index()
     roas_df = pd.merge(site_sales, site_spend, on="Site")
     roas_paid = roas_df[roas_df["Spend"] > 1000].copy()
-    roas_paid["ROAS"] = roas_paid["Sales"] / roas_paid["Spend"]
+    roas_paid["ROAS"] = roas_paid["Allocated_Sales"] / roas_paid["Spend"]
     roas_paid = roas_paid.sort_values("ROAS", ascending=True)
     fig2 = px.bar(
         roas_paid, x="ROAS", y="Site", orientation="h",
@@ -252,10 +276,10 @@ elif page == "📊 EDA Dashboard":
     fig2.update_layout(coloraxis_showscale=False, height=420)
     st.plotly_chart(fig2, use_container_width=True)
     st.warning(
-        "⚠️ **Caveat:** ROAS = total company sales ÷ site spend. Because Sales isn't tracked "
-        "per-site in this dataset, sites with very small spend can show enormous, misleading ROAS. "
-        "Only sites with >$1,000 total spend are shown to reduce (not eliminate) this distortion — "
-        "treat these as *directional* efficiency signals, not exact attribution."
+        "⚠️ **Caveat:** ROAS here uses the same spend-share attributed sales as Chart 1, divided "
+        "by each site's spend. Only sites with >$1,000 total spend are shown to avoid divide-by-near-zero "
+        "distortion. Treat these as *directional* efficiency signals based on estimated attribution, "
+        "not verified per-site revenue."
     )
 
     st.markdown("---")
